@@ -1,4 +1,4 @@
-# UARTDrocher
+# ESP8266 multitool
 
 Мультитул‑прошивка для NodeMCU V3 (ESP8266MOD): мост UART по Wi‑Fi (telnet) и I2C‑инструменты (скан, чтение/запись, пассивный лог).
 
