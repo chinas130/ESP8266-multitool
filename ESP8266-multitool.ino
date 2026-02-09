@@ -1,9 +1,9 @@
 // NodeMCU V3 (ESP8266MOD) UART bridge for set-top box console.
-// UART0 pins with swap: RX=GPIO13, TX=GPIO15 (recommended to free USB).
-// USB serial remains for power only when swap is enabled.
-
+// UART0 pins with swap enabled: RX = GPIO13, TX = GPIO15 (recommended to free up USB for power only).
+// When UART swap is enabled, the onboard USB serial cannot be used for communication (power only).
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <SPI.h>
 #include <Wire.h>
 
 // Configuration
@@ -37,6 +37,15 @@ static uint8_t i2cSda = 4;  // D2
 static uint8_t i2cScl = 5;  // D1
 static uint32_t i2cClock = 100000;
 static bool i2cPassive = false;
+
+static bool spiInited = false;
+static uint8_t spiSck = 14;   // D5
+static uint8_t spiMiso = 12;  // D6
+static uint8_t spiMosi = 13;  // D7
+static uint8_t spiCs = 16;    // D0 (avoid GPIO15 conflict with UART swap)
+static uint32_t spiClock = 1000000;
+static uint8_t spiMode = 0;
+static SPIClass spi(HSPI);
 
 enum I2CEventType : uint8_t {
   kI2CStart = 0,
@@ -245,6 +254,156 @@ static void i2cSetModePassive(bool passive) {
   }
 }
 
+static void spiEnsureInit() {
+  if (spiInited) return;
+  spi.begin(spiSck, spiMiso, spiMosi, spiCs);
+  pinMode(spiCs, OUTPUT);
+  digitalWrite(spiCs, HIGH);
+  spiInited = true;
+}
+
+static uint8_t spiXfer(uint8_t v) {
+  return spi.transfer(v);
+}
+
+static void spiSelect() {
+  spi.beginTransaction(SPISettings(spiClock, MSBFIRST, spiMode));
+  digitalWrite(spiCs, LOW);
+}
+
+static void spiDeselect() {
+  digitalWrite(spiCs, HIGH);
+  spi.endTransaction();
+}
+
+static void spiWriteEnable() {
+  spiSelect();
+  spiXfer(0x06);
+  spiDeselect();
+}
+
+static uint8_t spiReadStatus() {
+  spiSelect();
+  spiXfer(0x05);
+  uint8_t st = spiXfer(0xFF);
+  spiDeselect();
+  return st;
+}
+
+static bool spiWaitReady(uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if ((spiReadStatus() & 0x01) == 0) return true;
+    delay(1);
+    yield();
+  }
+  return false;
+}
+
+static void spiReadJedec() {
+  spiEnsureInit();
+  spiSelect();
+  spiXfer(0x9F);
+  uint8_t m = spiXfer(0xFF);
+  uint8_t t = spiXfer(0xFF);
+  uint8_t c = spiXfer(0xFF);
+  spiDeselect();
+  telnetClient.printf("SPI JEDEC: %02X %02X %02X\r\n", m, t, c);
+}
+
+static void spiReadData(uint32_t addr, uint32_t len) {
+  spiEnsureInit();
+  if (len > 256) len = 256;
+  spiSelect();
+  spiXfer(0x03);
+  spiXfer(static_cast<uint8_t>(addr >> 16));
+  spiXfer(static_cast<uint8_t>(addr >> 8));
+  spiXfer(static_cast<uint8_t>(addr));
+  telnetClient.printf("SPI 0x%06lX: ", static_cast<unsigned long>(addr));
+  for (uint32_t i = 0; i < len; ++i) {
+    uint8_t b = spiXfer(0xFF);
+    telnetClient.printf("%02X ", b);
+  }
+  spiDeselect();
+  telnetClient.println();
+}
+
+static void spiWriteData(uint32_t addr, uint8_t *data, uint32_t len) {
+  spiEnsureInit();
+  if (len == 0) return;
+  uint32_t offset = 0;
+  while (offset < len) {
+    uint32_t pageOff = addr & 0xFF;
+    uint32_t chunk = 256 - pageOff;
+    if (chunk > (len - offset)) chunk = len - offset;
+
+    spiWriteEnable();
+    spiSelect();
+    spiXfer(0x02);
+    spiXfer(static_cast<uint8_t>(addr >> 16));
+    spiXfer(static_cast<uint8_t>(addr >> 8));
+    spiXfer(static_cast<uint8_t>(addr));
+    for (uint32_t i = 0; i < chunk; ++i) {
+      spiXfer(data[offset + i]);
+    }
+    spiDeselect();
+
+    if (!spiWaitReady(5000)) {
+      telnetClient.println(F("ERR SPI TIMEOUT"));
+      return;
+    }
+
+    addr += chunk;
+    offset += chunk;
+  }
+  telnetClient.println(F("OK SPI WRITE"));
+}
+
+static void spiErase4k(uint32_t addr) {
+  spiEnsureInit();
+  spiWriteEnable();
+  spiSelect();
+  spiXfer(0x20);
+  spiXfer(static_cast<uint8_t>(addr >> 16));
+  spiXfer(static_cast<uint8_t>(addr >> 8));
+  spiXfer(static_cast<uint8_t>(addr));
+  spiDeselect();
+  if (!spiWaitReady(10000)) {
+    telnetClient.println(F("ERR SPI TIMEOUT"));
+    return;
+  }
+  telnetClient.println(F("OK SPI ERASE 4K"));
+}
+
+static void spiErase64k(uint32_t addr) {
+  spiEnsureInit();
+  spiWriteEnable();
+  spiSelect();
+  spiXfer(0xD8);
+  spiXfer(static_cast<uint8_t>(addr >> 16));
+  spiXfer(static_cast<uint8_t>(addr >> 8));
+  spiXfer(static_cast<uint8_t>(addr));
+  spiDeselect();
+  if (!spiWaitReady(60000)) {
+    telnetClient.println(F("ERR SPI TIMEOUT"));
+    return;
+  }
+  telnetClient.println(F("OK SPI ERASE 64K"));
+}
+
+static void spiEraseChip() {
+  spiEnsureInit();
+  spiWriteEnable();
+  spiSelect();
+  spiXfer(0xC7);
+  spiDeselect();
+  if (!spiWaitReady(300000)) {
+    telnetClient.println(F("ERR SPI TIMEOUT"));
+    return;
+  }
+  telnetClient.println(F("OK SPI ERASE CHIP"));
+}
+
 static void printTelnetHelp() {
   if (!telnetClient) return;
   telnetClient.println();
@@ -264,6 +423,15 @@ static void printTelnetHelp() {
   telnetClient.println(F("  /i2c pins <sda> <scl>  - set I2C pins (dec)"));
   telnetClient.println(F("  /i2c clock <hz>   - set I2C clock"));
   telnetClient.println(F("  /i2c mode passive|master - set I2C mode"));
+  telnetClient.println(F("  /spi id            - read JEDEC ID"));
+  telnetClient.println(F("  /spi read <addr> <len>"));
+  telnetClient.println(F("  /spi write <addr> <b..>"));
+  telnetClient.println(F("  /spi erase4k <addr>"));
+  telnetClient.println(F("  /spi erase64k <addr>"));
+  telnetClient.println(F("  /spi erasechip"));
+  telnetClient.println(F("  /spi pins <sck> <miso> <mosi> <cs>"));
+  telnetClient.println(F("  /spi clock <hz>"));
+  telnetClient.println(F("  /spi mode <0-3>"));
   telnetClient.println(F("  /quit            - close connection"));
   telnetClient.println();
   telnetClient.println(F("Bridge mode: all bytes go to UART."));
@@ -480,6 +648,131 @@ static void handleTelnetCommand(char *line) {
       return;
     }
     telnetClient.println(F("ERR I2C"));
+    return;
+  }
+  if (strncasecmp(cmd, "spi ", 4) == 0) {
+    char *args = cmd + 4;
+    char *tok = strtok(args, " ");
+    if (!tok) {
+      telnetClient.println(F("ERR SPI"));
+      return;
+    }
+    if (strcasecmp(tok, "id") == 0) {
+      spiReadJedec();
+      return;
+    }
+    if (strcasecmp(tok, "read") == 0) {
+      char *a = strtok(nullptr, " ");
+      char *n = strtok(nullptr, " ");
+      uint32_t addr = 0, len = 0;
+      if (!a || !n || !parseHexOrDec(a, &addr) || !parseHexOrDec(n, &len) ||
+          len == 0) {
+        telnetClient.println(F("ERR SPI READ"));
+        return;
+      }
+      spiReadData(addr, len);
+      return;
+    }
+    if (strcasecmp(tok, "write") == 0) {
+      char *a = strtok(nullptr, " ");
+      if (!a) {
+        telnetClient.println(F("ERR SPI WRITE"));
+        return;
+      }
+      uint32_t addr = 0;
+      if (!parseHexOrDec(a, &addr)) {
+        telnetClient.println(F("ERR SPI WRITE"));
+        return;
+      }
+      uint8_t data[256];
+      uint32_t count = 0;
+      char *b = nullptr;
+      while ((b = strtok(nullptr, " ")) != nullptr && count < sizeof(data)) {
+        uint32_t v = 0;
+        if (!parseHexOrDec(b, &v) || v > 0xFF) {
+          telnetClient.println(F("ERR SPI WRITE"));
+          return;
+        }
+        data[count++] = static_cast<uint8_t>(v);
+      }
+      if (count == 0) {
+        telnetClient.println(F("ERR SPI WRITE"));
+        return;
+      }
+      spiWriteData(addr, data, count);
+      return;
+    }
+    if (strcasecmp(tok, "erase4k") == 0) {
+      char *a = strtok(nullptr, " ");
+      uint32_t addr = 0;
+      if (!a || !parseHexOrDec(a, &addr)) {
+        telnetClient.println(F("ERR SPI ERASE"));
+        return;
+      }
+      spiErase4k(addr);
+      return;
+    }
+    if (strcasecmp(tok, "erase64k") == 0) {
+      char *a = strtok(nullptr, " ");
+      uint32_t addr = 0;
+      if (!a || !parseHexOrDec(a, &addr)) {
+        telnetClient.println(F("ERR SPI ERASE"));
+        return;
+      }
+      spiErase64k(addr);
+      return;
+    }
+    if (strcasecmp(tok, "erasechip") == 0) {
+      spiEraseChip();
+      return;
+    }
+    if (strcasecmp(tok, "pins") == 0) {
+      char *sck = strtok(nullptr, " ");
+      char *miso = strtok(nullptr, " ");
+      char *mosi = strtok(nullptr, " ");
+      char *cs = strtok(nullptr, " ");
+      uint32_t vsck = 0, vmiso = 0, vmosi = 0, vcs = 0;
+      if (!sck || !miso || !mosi || !cs || !parseUint32(sck, &vsck) ||
+          !parseUint32(miso, &vmiso) || !parseUint32(mosi, &vmosi) ||
+          !parseUint32(cs, &vcs)) {
+        telnetClient.println(F("ERR SPI PINS"));
+        return;
+      }
+      spiSck = static_cast<uint8_t>(vsck);
+      spiMiso = static_cast<uint8_t>(vmiso);
+      spiMosi = static_cast<uint8_t>(vmosi);
+      spiCs = static_cast<uint8_t>(vcs);
+      spiInited = false;
+      telnetClient.printf("OK SPI PINS %u %u %u %u\r\n", spiSck, spiMiso,
+                          spiMosi, spiCs);
+      return;
+    }
+    if (strcasecmp(tok, "clock") == 0) {
+      char *hz = strtok(nullptr, " ");
+      uint32_t v = 0;
+      if (!hz || !parseUint32(hz, &v) || v < 10000 || v > 20000000) {
+        telnetClient.println(F("ERR SPI CLOCK"));
+        return;
+      }
+      spiClock = v;
+      spiInited = false;
+      telnetClient.printf("OK SPI CLOCK %lu\r\n",
+                          static_cast<unsigned long>(spiClock));
+      return;
+    }
+    if (strcasecmp(tok, "mode") == 0) {
+      char *m = strtok(nullptr, " ");
+      uint32_t v = 0;
+      if (!m || !parseUint32(m, &v) || v > 3) {
+        telnetClient.println(F("ERR SPI MODE"));
+        return;
+      }
+      spiMode = static_cast<uint8_t>(v);
+      spiInited = false;
+      telnetClient.printf("OK SPI MODE %u\r\n", spiMode);
+      return;
+    }
+    telnetClient.println(F("ERR SPI"));
     return;
   }
   if (strcasecmp(cmd, "crlf") == 0) {

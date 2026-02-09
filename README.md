@@ -2,12 +2,16 @@
 
 Мультитул‑прошивка для NodeMCU V3 (ESP8266MOD): мост UART по Wi‑Fi (telnet) и I2C‑инструменты (скан, чтение/запись, пассивный лог).
 
+## ВНИМАНИЕ!!!
+!!!ЧТЕНИЕ/ЗАПИСЬ SPI НЕ ПРОВЕРЕНЫ НА РАБОТОСПОСОБНОСТЬ!!!
+
 ## Возможности
 
 - UART мост по Wi‑Fi (telnet) для работы с консолью устройств.
 - Управление концами строк (CR/CRLF/LF) для старых загрузчиков.
 - I2C master: scan/read/write, поддержка 8‑ и 16‑битных регистров.
 - I2C passive: слушатель с логированием транзакций (best‑effort).
+- SPI flash: чтение, запись, стирание, JEDEC ID.
 
 ## Подключение UART
 
@@ -28,6 +32,18 @@
 - GND общий
 
 Можно поменять пины командой `i2c pins <sda> <scl>`.
+
+## Подключение SPI
+
+По умолчанию (HSPI):
+
+- SCK = GPIO14 (D5)
+- MISO = GPIO12 (D6)
+- MOSI = GPIO13 (D7)
+- CS = GPIO16 (D0)
+- GND общий
+
+Пины можно изменить командой `spi pins <sck> <miso> <mosi> <cs>`.
 
 ## Wi‑Fi
 
@@ -73,6 +89,27 @@ i2c scan
 i2c read 0x50 0x00 16
 i2c read16 0x68 0x0000 8
 i2c readraw 0x32 8
+```
+
+## SPI команды
+
+- `spi id`
+- `spi read <addr> <len>`
+- `spi write <addr> <b1> <b2> ...`
+- `spi erase4k <addr>`
+- `spi erase64k <addr>`
+- `spi erasechip`
+- `spi pins <sck> <miso> <mosi> <cs>`
+- `spi clock <hz>`
+- `spi mode <0-3>`
+
+Примеры:
+
+```
+spi id
+spi read 0x000000 64
+spi erase4k 0x000000
+spi write 0x000000 DE AD BE EF
 ```
 
 ## Примечания

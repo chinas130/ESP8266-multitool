@@ -1,0 +1,6 @@
+# Arduino temp dirs
+.build
+.cache
+
+# vscode files
+.vscode
